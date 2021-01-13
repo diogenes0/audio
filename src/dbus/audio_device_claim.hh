@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <dbus/dbus.h>
 #include <memory>
 #include <optional>

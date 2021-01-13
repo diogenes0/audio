@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <array>
 #include <memory>
 
