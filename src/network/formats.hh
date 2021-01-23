@@ -2,9 +2,10 @@
 
 #include <cstdint>
 
+#include "base64.hh"
+#include "crypto.hh"
 #include "opus.hh"
 #include "parser.hh"
-#include "spans.hh"
 
 struct AudioFrame
 {
@@ -84,6 +85,7 @@ struct NetArray
   }
 
   span_view<T> as_span_view() const { return span_view<T> { elements.data(), length }; }
+  operator span_view<T>() const { return as_span_view(); }
 
   const T* begin() const { return as_span_view().begin(); }
   const T* end() const { return as_span_view().end(); }
@@ -96,6 +98,51 @@ struct NetArray
 
     elements[length] = element;
     length++;
+  }
+};
+
+template<uint8_t capacity>
+class NetString
+{
+  std::string storage_;
+
+public:
+  uint32_t serialized_length() const
+  {
+    if ( storage_.size() > capacity ) {
+      throw std::runtime_error( "invalid NetString" );
+    }
+
+    return 1 + storage_.size();
+  }
+
+  void serialize( Serializer& s ) const
+  {
+    s.integer( uint8_t( storage_.size() ) );
+    s.string( storage_ );
+  }
+
+  void parse( Parser& p )
+  {
+    uint8_t length {};
+    p.integer( length );
+    if ( length > capacity ) {
+      p.set_error();
+      return;
+    }
+    storage_.resize( length );
+    p.string( string_span::from_view( storage_ ) );
+  }
+
+  const std::string& str() const { return storage_; }
+  operator const std::string &() const { return str(); }
+
+  NetString( const std::string_view s )
+    : storage_( s )
+  {
+    if ( storage_.size() > capacity ) {
+      throw std::runtime_error( "invalid NetString" );
+    }
   }
 };
 
@@ -127,4 +174,17 @@ struct Packet
 
   Packet() {}
   Packet( Parser& p ) { parse( p ); }
+};
+
+struct KeyMessage
+{
+  static constexpr char keyreq_id = uint8_t( 254 );
+  static constexpr char keyreq_server_id = uint8_t( 255 );
+
+  NetInteger<uint8_t> id {};
+  KeyPair key_pair {};
+
+  constexpr uint32_t serialized_length() const { return id.serialized_length() + key_pair.serialized_length(); }
+  void serialize( Serializer& s ) const;
+  void parse( Parser& p );
 };
