@@ -10,7 +10,7 @@ NetworkClient::NetworkSession::NetworkSession( const uint8_t node_id,
                                                const size_t audio_cursor )
   : connection( node_id, 0, CryptoSession( session_key.uplink, session_key.downlink ), destination )
   , peer_clock( audio_cursor )
-  , cursor( 900, false )
+  , cursor( 360, false )
 {}
 
 void NetworkClient::NetworkSession::transmit_frame( OpusEncoderProcess& source, UDPSocket& socket )
@@ -93,9 +93,9 @@ NetworkClient::NetworkClient( const Address& server,
   loop.add_rule( "network receive", socket_, Direction::In, [&] {
     Address src { nullptr, 0 };
     Ciphertext ciphertext;
-    socket_.recv( src, ciphertext.data );
-    if ( ciphertext.size() > 24 ) {
-      const uint8_t node_id = ciphertext.data.back();
+    ciphertext.resize( socket_.recv( src, ciphertext.mutable_buffer() ) );
+    if ( ciphertext.length() > 24 ) {
+      const uint8_t node_id = ciphertext.as_string_view().back();
       switch ( node_id ) {
         case uint8_t( KeyMessage::keyreq_server_id ):
           if ( not session_.has_value() ) {
@@ -159,5 +159,12 @@ void NetworkClient::summary( ostream& out ) const
   out << " timeouts=" << stats_.timeouts << "\n";
   if ( session_.has_value() ) {
     session_->summary( out );
+  }
+}
+
+void NetworkClient::set_cursor_lag( const uint16_t num_samples )
+{
+  if ( session_.has_value() ) {
+    session_->cursor.set_target_lag( num_samples );
   }
 }

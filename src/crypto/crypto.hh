@@ -7,6 +7,7 @@
 #include "ae.hh"
 #include "base64.hh"
 #include "spans.hh"
+#include "stackbuffer.hh"
 
 class Nonce
 {
@@ -26,25 +27,8 @@ public:
   uint64_t value() const;
 };
 
-template<int max_len>
-struct TextBuffer
-{
-  alignas( 16 ) std::array<char, max_len> buffer {};
-  string_span data { buffer.data(), max_len };
-  operator string_span() { return data; }
-  operator std::string_view() const { return data; }
-  size_t size() const { return data.size(); }
-  void resize( const size_t size )
-  {
-    data = { buffer.data(), size };
-    validate();
-  }
-
-  void validate() const;
-};
-
-using Plaintext = TextBuffer<1456>;
-using Ciphertext = TextBuffer<1456 + 16 + 8 + 8>; /* + tag + nonce + AD */
+using Plaintext = StackBuffer<16, uint16_t, 1456>;
+using Ciphertext = StackBuffer<16, uint16_t, 1456 + 16 + 8 + 8>; /* + tag + nonce + AD */
 
 class CryptoSession
 {
