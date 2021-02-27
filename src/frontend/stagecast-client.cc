@@ -1,13 +1,16 @@
 #include <cstdlib>
 #include <iostream>
 
+#include <sched.h>
+
 #include "alsa_devices.hh"
 #include "audio_task.hh"
+#include "control_messages.hh"
 #include "controller.hh"
 #include "encoder_task.hh"
-#include "endpoints.hh"
 #include "eventloop.hh"
 #include "keys.hh"
+#include "networkclient.hh"
 #include "stats_printer.hh"
 
 #ifndef NDBUS
@@ -20,6 +23,15 @@ void program_body( const string& host, const string& service, const string& key_
 {
   ios::sync_with_stdio( false );
 
+  /* real-time priority */
+  try {
+    sched_param param;
+    param.sched_priority = CheckSystemCall( "sched_get_priority_max", SCHED_FIFO );
+    CheckSystemCall( "sched_setscheduler", sched_setscheduler( 0, SCHED_FIFO | SCHED_RESET_ON_FORK, &param ) );
+  } catch ( const exception& e ) {
+    cerr << e.what() << "\n";
+  }
+
   /* read key */
   ReadOnlyFile keyfile { key_filename };
   Parser p { keyfile };
@@ -30,7 +42,7 @@ void program_body( const string& host, const string& service, const string& key_
   auto loop = make_shared<EventLoop>();
 
   /* Audio task gets first priority in EventLoop */
-  const auto [name, interface_name] = ALSADevices::find_device( "UAC-2, USB Audio" );
+  const auto [name, interface_name] = ALSADevices::find_device( { "Scarlett", "UAC-2, USB Audio" } );
 
 #ifndef NDBUS
   const auto device_claim = AudioDeviceClaim::try_claim( name );
@@ -46,12 +58,40 @@ void program_body( const string& host, const string& service, const string& key_
   auto network_client = make_shared<NetworkClient>( stagecast_server, key, encoder, uac2, *loop );
 
   /* Controller registers itself in EventLoop */
-  ClientController controller { network_client, *loop };
+  ClientController controller { network_client, uac2, *loop };
 
   /* Print out statistics to terminal */
   StatsPrinterTask stats_printer { loop };
   stats_printer.add( uac2 );
   stats_printer.add( network_client );
+
+  /* Send statistics to server */
+  const uint64_t update_interval = 50'000'000;
+  uint64_t next_update = Timer::timestamp_ns() + update_interval;
+  NetString update_str;
+  loop->add_rule(
+    "stats update",
+    [&] {
+      client_report report;
+      report.resets = network_client->cursor().stats().resets;
+      report.target_lag
+        = min( uint32_t( numeric_limits<uint16_t>::max() ), network_client->cursor().target_lag_samples() );
+      report.min_lag
+        = min( uint32_t( numeric_limits<uint16_t>::max() ), network_client->cursor().min_lag_samples() );
+      report.max_lag
+        = min( uint32_t( numeric_limits<uint16_t>::max() ), network_client->cursor().max_lag_samples() );
+      report.actual_lag = network_client->cursor().stats().mean_margin_to_frontier;
+      report.quality = network_client->cursor().stats().quality;
+      report.self_gain = uac2->loopback_gain();
+
+      Serializer s { update_str.mutable_buffer() };
+      s.object( report );
+      update_str.resize( s.bytes_written() );
+
+      network_client->queue_update( update_str );
+      next_update = Timer::timestamp_ns() + update_interval;
+    },
+    [&] { return network_client->has_session() and ( Timer::timestamp_ns() > next_update ); } );
 
   /* Start audio device and event loop */
   uac2->device().start();

@@ -1,16 +1,16 @@
-#include "endpoints.hh"
+#include "networkclient.hh"
 #include "timestamp.hh"
 
 using namespace std;
 using namespace std::chrono;
 
+using Option = RubberBand::RubberBandStretcher::Option;
+
 NetworkClient::NetworkSession::NetworkSession( const uint8_t node_id,
                                                const KeyPair& session_key,
-                                               const Address& destination,
-                                               const size_t audio_cursor )
+                                               const Address& destination )
   : connection( node_id, 0, CryptoSession( session_key.uplink, session_key.downlink ), destination )
-  , peer_clock( audio_cursor )
-  , cursor( 960, false )
+  , cursor( 960, 120, 1920 )
 {}
 
 void NetworkClient::NetworkSession::transmit_frame( OpusEncoderProcess& source, UDPSocket& socket )
@@ -19,20 +19,32 @@ void NetworkClient::NetworkSession::transmit_frame( OpusEncoderProcess& source, 
   connection.send_packet( socket );
 }
 
-void NetworkClient::NetworkSession::network_receive( const Ciphertext& ciphertext, const size_t audio_cursor )
+void NetworkClient::NetworkSession::network_receive( const Ciphertext& ciphertext )
 {
   connection.receive_packet( ciphertext );
-  peer_clock.new_sample( audio_cursor, connection.unreceived_beyond_this_frame_index() * opus_frame::NUM_SAMPLES );
 }
 
-void NetworkClient::NetworkSession::decode( const size_t audio_cursor,
-                                            const size_t decode_cursor,
-                                            AudioBuffer& output )
+void NetworkClient::NetworkSession::decode( const size_t decode_cursor,
+                                            OpusDecoderProcess& decoder,
+                                            RubberBand::RubberBandStretcher& stretcher,
+                                            ChannelPair& output )
 {
-  peer_clock.time_passes( audio_cursor );
-
   /* decode server's Opus frames to playback buffer */
-  cursor.sample( connection.frames(), decode_cursor, peer_clock.value(), peer_clock.jitter(), output );
+  const size_t frontier_sample_index
+    = connection.unreceived_beyond_this_frame_index() * opus_frame::NUM_SAMPLES_MINLATENCY;
+
+  cursor.setup( decode_cursor, frontier_sample_index );
+
+  Cursor::AudioSlice audio;
+
+  while ( cursor.initialized() and decode_cursor > cursor.num_samples_output() ) {
+    cursor.sample( connection.frames(), frontier_sample_index, decoder, stretcher, audio );
+
+    if ( audio.good ) {
+      output.ch1().region( audio.sample_index, audio.length ).copy( audio.ch1_span() );
+      output.ch2().region( audio.sample_index, audio.length ).copy( audio.ch2_span() );
+    }
+  }
 
   /* pop used Opus frames from server */
   connection.pop_frames( min( cursor.ok_to_pop( connection.frames() ),
@@ -41,7 +53,6 @@ void NetworkClient::NetworkSession::decode( const size_t audio_cursor,
 
 void NetworkClient::NetworkSession::summary( std::ostream& out ) const
 {
-  peer_clock.summary( out );
   cursor.summary( out );
   connection.summary( out );
 }
@@ -59,7 +70,7 @@ void NetworkClient::process_keyreply( const Ciphertext& ciphertext )
       p.clear_error();
       return;
     }
-    session_.emplace( keys.id, keys.key_pair, server_, dest_->cursor() );
+    session_.emplace( keys.id, keys.key_pair, server_ );
     stats_.new_sessions++;
   } else {
     stats_.bad_packets++;
@@ -74,11 +85,17 @@ NetworkClient::NetworkClient( const Address& server,
   : server_( server )
   , name_( key.name() )
   , long_lived_crypto_( key.key_pair().uplink, key.key_pair().downlink, true )
+  , stretcher_( 48000,
+                2,
+                Option::OptionProcessRealTime | Option::OptionThreadingNever | Option::OptionPitchHighConsistency
+                  | Option::OptionWindowShort )
   , source_( source )
   , dest_( dest )
   , next_key_request_( steady_clock::now() )
 {
   socket_.set_blocking( false );
+  stretcher_.setMaxProcessSize( opus_frame::NUM_SAMPLES_MINLATENCY );
+  stretcher_.calculateStretch();
 
   loop.add_rule(
     "network transmit",
@@ -104,7 +121,7 @@ NetworkClient::NetworkClient( const Address& server,
           break;
         case 0:
           if ( session_.has_value() ) {
-            session_->network_receive( ciphertext, dest_->cursor() );
+            session_->network_receive( ciphertext );
           }
           break;
         default:
@@ -119,21 +136,25 @@ NetworkClient::NetworkClient( const Address& server,
   loop.add_rule(
     "decode",
     [&] {
-      session_->decode( dest_->cursor(), decode_cursor_, dest_->playback() );
-      decode_cursor_ += opus_frame::NUM_SAMPLES;
+      session_->decode( decode_cursor_, decoder_, stretcher_, dest_->playback() );
+      decode_cursor_ += opus_frame::NUM_SAMPLES_MINLATENCY;
 
       if ( session_->connection.sender_stats().last_good_ack_ts + 4'000'000'000 < Timer::timestamp_ns() ) {
         stats_.timeouts++;
         session_.reset();
       }
     },
-    [&] { return session_.has_value() and ( dest_->cursor() + opus_frame::NUM_SAMPLES + 60 >= decode_cursor_ ); } );
+    [&] {
+      return session_.has_value()
+             and ( dest_->cursor() + opus_frame::NUM_SAMPLES_MINLATENCY + 60 >= decode_cursor_ );
+    } );
 
   loop.add_rule(
     "play silence",
-    [&] { decode_cursor_ += opus_frame::NUM_SAMPLES; },
+    [&] { decode_cursor_ += opus_frame::NUM_SAMPLES_MINLATENCY; },
     [&] {
-      return ( !session_.has_value() ) and ( dest_->cursor() + opus_frame::NUM_SAMPLES + 60 >= decode_cursor_ );
+      return ( !session_.has_value() )
+             and ( dest_->cursor() + opus_frame::NUM_SAMPLES_MINLATENCY + 60 >= decode_cursor_ );
     } );
 
   loop.add_rule(
@@ -162,9 +183,20 @@ void NetworkClient::summary( ostream& out ) const
   }
 }
 
-void NetworkClient::set_cursor_lag( const uint16_t num_samples )
+void NetworkClient::json_summary( Json::Value& root ) const
 {
   if ( session_.has_value() ) {
-    session_->cursor.set_target_lag( num_samples );
+    session_->json_summary( root[name_]["client"]["feed"] );
+  } else {
+    Cursor::default_json_summary( root[name_]["client"]["feed"] );
+  }
+}
+
+void NetworkClient::set_cursor_lag( const uint16_t target_samples,
+                                    const uint16_t min_samples,
+                                    const uint16_t max_samples )
+{
+  if ( session_.has_value() ) {
+    session_->cursor.set_target_lag( target_samples, min_samples, max_samples );
   }
 }

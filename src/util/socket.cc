@@ -3,6 +3,7 @@
 #include "exception.hh"
 
 #include <cstddef>
+#include <netinet/tcp.h>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -135,6 +136,25 @@ void UDPSocket::send( const string_view payload )
   register_write();
 }
 
+void UnixDatagramSocket::sendto_ignore_errors( const Address& destination, const std::string_view payload )
+{
+  ::sendto( fd_num(), payload.data(), payload.length(), 0, destination, destination.size() );
+  register_write();
+}
+
+size_t UnixDatagramSocket::recv( string_span payload )
+{
+  const ssize_t recv_len
+    = CheckSystemCall( "recv", ::recv( fd_num(), payload.mutable_data(), payload.size(), MSG_TRUNC ) );
+
+  register_read();
+  if ( recv_len > ssize_t( payload.size() ) ) {
+    throw runtime_error( "recvfrom (oversized datagram)" );
+  }
+
+  return recv_len;
+}
+
 // mark the socket as listening for incoming connections
 //! \param[in] backlog is the number of waiting connections to queue (see [listen(2)](\ref man2::listen))
 void TCPSocket::listen( const int backlog )
@@ -189,4 +209,9 @@ void Socket::throw_if_error() const
   if ( socket_error ) {
     throw unix_error( "socket error", socket_error );
   }
+}
+
+void TCPSocket::set_tcp_nodelay( const bool tcp_nodelay )
+{
+  setsockopt( IPPROTO_TCP, TCP_NODELAY, int( tcp_nodelay ) );
 }

@@ -3,33 +3,34 @@
 
 using namespace std;
 
+OpusDecoderProcess::OpusDecoderProcess( const bool independent_channels )
+  : dec1_( 48000, independent_channels ? 1 : 2 )
+  , dec2_( independent_channels ? make_optional<OpusDecoder>( 48000, 1 ) : nullopt )
+{}
+
 void OpusDecoderProcess::decode( const opus_frame& ch1,
                                  const opus_frame& ch2,
-                                 const size_t global_sample_index,
-                                 AudioBuffer& output )
+                                 span<float> ch1_out,
+                                 span<float> ch2_out )
 {
-  if ( global_sample_index < output.range_begin()
-       or global_sample_index + opus_frame::NUM_SAMPLES >= output.range_end() ) {
-    stats_.ignored_decodes++;
-    return;
-  }
-
-  dec1.decode( ch1, output.ch1().region( global_sample_index, opus_frame::NUM_SAMPLES ) );
-  dec2.decode( ch2, output.ch2().region( global_sample_index, opus_frame::NUM_SAMPLES ) );
-
-  stats_.successful_decodes++;
+  dec1_.decode( ch1, ch1_out );
+  dec2_.value().decode( ch2, ch2_out );
 }
 
-void OpusDecoderProcess::decode_missing( const size_t global_sample_index, AudioBuffer& output )
+void OpusDecoderProcess::decode_stereo( const opus_frame& frame, span<float> ch1_out, span<float> ch2_out )
 {
-  if ( global_sample_index < output.range_begin()
-       or global_sample_index + opus_frame::NUM_SAMPLES >= output.range_end() ) {
-    stats_.ignored_decodes++;
-    return;
+  dec1_.decode_stereo( frame, ch1_out, ch2_out );
+  if ( dec2_.has_value() ) {
+    throw runtime_error( "OpusDecoderProcess::decode_stereo called on independent-channel decoder" );
   }
+}
 
-  dec1.decode_missing( output.ch1().region( global_sample_index, opus_frame::NUM_SAMPLES ) );
-  dec2.decode_missing( output.ch2().region( global_sample_index, opus_frame::NUM_SAMPLES ) );
-
-  stats_.missing_decodes++;
+void OpusDecoderProcess::decode_missing( span<float> ch1_out, span<float> ch2_out )
+{
+  if ( dec2_.has_value() ) {
+    dec1_.decode_missing( ch1_out );
+    dec2_->decode_missing( ch2_out );
+  } else {
+    dec1_.decode_missing_stereo( ch1_out, ch2_out );
+  }
 }

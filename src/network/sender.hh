@@ -6,9 +6,10 @@
 #include "formats.hh"
 #include "typed_ring_buffer.hh"
 
+template<class FrameType>
 class NetworkSender
 {
-  struct AudioFrameStatus
+  struct FrameStatus
   {
     bool outstanding : 1;
     bool in_flight : 1;
@@ -16,8 +17,8 @@ class NetworkSender
     bool needs_send() const { return outstanding and not in_flight; }
   };
 
-  EndlessBuffer<AudioFrame> frames_ { 8192 }; // 20.48 seconds
-  EndlessBuffer<AudioFrameStatus> frame_status_ { 8192 };
+  EndlessBuffer<FrameType> frames_ { 8192 }; // 20.48 seconds
+  EndlessBuffer<FrameStatus> frame_status_ { 8192 };
   uint32_t next_frame_index_ {};
 
   constexpr static uint8_t reorder_window = 2; /* 2 packets, about 5 ms */
@@ -26,7 +27,7 @@ class NetworkSender
 
   struct PacketSentRecord
   {
-    Packet::Record record;
+    typename Packet<FrameType>::Record record;
     uint64_t sent_timestamp;
     bool acked : 1;
     bool assumed_lost : 1;
@@ -59,10 +60,39 @@ private:
   Statistics stats_ {};
 
 public:
-  void push_frame( OpusEncoderProcess& encoder );
+  template<class SourceType>
+  void push_frame( SourceType& encoder )
+  {
+    if ( frames_.range_begin() != frame_status_.range_begin() ) {
+      throw std::runtime_error( "NetworkSender internal error" );
+    }
 
-  void set_sender_section( Packet::SenderSection& p );
-  void receive_receiver_section( const Packet::ReceiverSection& receiver_section );
+    if ( next_frame_index_ < frames_.range_begin() ) {
+      throw std::runtime_error( "NetworkSender internal error: next_frame_index_ < frames_.range_begin()" );
+    }
+
+    if ( need_immediate_send_ ) {
+      throw std::runtime_error( "packet pushed but not sent" );
+    }
+
+    if ( next_frame_index_ >= frames_.range_end() ) {
+      const size_t frames_to_drop = next_frame_index_ - frames_.range_end() + 1;
+      frames_.pop( frames_to_drop );
+      frame_status_.pop( frames_to_drop );
+      stats_.frames_dropped += frames_to_drop;
+    }
+
+    frames_.at( next_frame_index_ ) = encoder.front( next_frame_index_ );
+    frame_status_.at( next_frame_index_ ) = { true, false };
+    next_frame_index_++;
+
+    need_immediate_send_ = true;
+
+    encoder.pop_frame();
+  }
+
+  void set_sender_section( typename Packet<FrameType>::SenderSection& p );
+  void receive_receiver_section( const typename Packet<FrameType>::ReceiverSection& receiver_section );
 
   void summary( std::ostream& out ) const;
 

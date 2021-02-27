@@ -1,8 +1,10 @@
 #include "sender.hh"
+#include "ewma.hh"
 
 using namespace std;
 
-void NetworkSender::summary( ostream& out ) const
+template<class FrameType>
+void NetworkSender<FrameType>::summary( ostream& out ) const
 {
   out << "Sender info:";
 
@@ -46,7 +48,7 @@ void NetworkSender::summary( ostream& out ) const
 
   unsigned int num_outstanding = 0, num_in_flight = 0;
   /*
-  const span_view<AudioFrameStatus> statuses
+  const span_view<FrameStatus> statuses
     = frame_status_.region( frame_status_.range_begin(), next_frame_index_ - frame_status_.range_begin() );
   */
   for ( uint32_t i = frame_status_.range_begin(); i < next_frame_index_; i++ ) {
@@ -77,43 +79,8 @@ void NetworkSender::summary( ostream& out ) const
   out << "\n";
 }
 
-void NetworkSender::push_frame( OpusEncoderProcess& encoder )
-{
-  if ( frames_.range_begin() != frame_status_.range_begin() ) {
-    throw runtime_error( "NetworkSender internal error" );
-  }
-
-  /*
-  if ( encoder.frame_index() != next_frame_index_ ) {
-    throw runtime_error( "encoder/sender index mismatch" );
-  }
-  */
-
-  if ( next_frame_index_ < frames_.range_begin() ) {
-    throw runtime_error( "NetworkSender internal error: next_frame_index_ < frames_.range_begin()" );
-  }
-
-  if ( need_immediate_send_ ) {
-    throw runtime_error( "packet pushed but not sent" );
-  }
-
-  if ( next_frame_index_ >= frames_.range_end() ) {
-    const size_t frames_to_drop = next_frame_index_ - frames_.range_end() + 1;
-    frames_.pop( frames_to_drop );
-    frame_status_.pop( frames_to_drop );
-    stats_.frames_dropped += frames_to_drop;
-  }
-
-  frames_.at( next_frame_index_ ) = { next_frame_index_, encoder.front_ch1(), encoder.front_ch2() };
-  frame_status_.at( next_frame_index_ ) = { true, false };
-  next_frame_index_++;
-
-  need_immediate_send_ = true;
-
-  encoder.pop_frame();
-}
-
-void NetworkSender::set_sender_section( Packet::SenderSection& p )
+template<class FrameType>
+void NetworkSender<FrameType>::set_sender_section( typename Packet<FrameType>::SenderSection& p )
 {
   if ( frames_.range_begin() != frame_status_.range_begin() ) {
     throw runtime_error( "NetworkSender internal error" );
@@ -135,9 +102,9 @@ void NetworkSender::set_sender_section( Packet::SenderSection& p )
     }
 
     /* now, attempt to fill up the other slots for frames in the packet */
-    span<AudioFrameStatus> statuses
+    span<FrameStatus> statuses
       = frame_status_.region( frame_status_.range_begin(), next_frame_index_ - frame_status_.range_begin() );
-    const span_view<AudioFrame> frames
+    const span_view<FrameType> frames
       = frames_.region( frame_status_.range_begin(), next_frame_index_ - frame_status_.range_begin() );
     for ( uint32_t i = 0; i < statuses.size(); i++ ) {
       auto& status = statuses[i];
@@ -175,7 +142,8 @@ void NetworkSender::set_sender_section( Packet::SenderSection& p )
   stats_.packet_transmissions++;
 }
 
-void NetworkSender::assume_departed( const PacketSentRecord& pack, const bool is_loss )
+template<class FrameType>
+void NetworkSender<FrameType>::assume_departed( const PacketSentRecord& pack, const bool is_loss )
 {
   if ( pack.acked or pack.assumed_lost ) {
     return;
@@ -200,7 +168,9 @@ void NetworkSender::assume_departed( const PacketSentRecord& pack, const bool is
   }
 }
 
-void NetworkSender::receive_receiver_section( const Packet::ReceiverSection& receiver_section )
+template<class FrameType>
+void NetworkSender<FrameType>::receive_receiver_section(
+  const typename Packet<FrameType>::ReceiverSection& receiver_section )
 {
   if ( frames_.range_begin() != frame_status_.range_begin() ) {
     throw runtime_error( "NetworkSender internal error" );
@@ -255,8 +225,7 @@ void NetworkSender::receive_receiver_section( const Packet::ReceiverSection& rec
       if ( time_diff <= 0 ) {
         stats_.invalid_timestamp++;
       } else {
-        stats_.smoothed_rtt
-          = stats_.SRTT_ALPHA * float( time_diff ) + ( 1 - stats_.SRTT_ALPHA ) * stats_.smoothed_rtt;
+        ewma_update( stats_.smoothed_rtt, float( time_diff ), stats_.SRTT_ALPHA );
       }
 
       for ( const uint32_t frame_index : pack.record.frames ) {
@@ -290,7 +259,8 @@ void NetworkSender::receive_receiver_section( const Packet::ReceiverSection& rec
   }
 
   for ( unsigned int seqno = start_of_range_to_assume_departed; seqno < end_of_range_to_assume_departed; seqno++ ) {
-    if ( not packets_in_flight_[seqno].acked ) {
+    if ( packets_in_flight_.range_begin() <= seqno and packets_in_flight_.range_end() > seqno
+         and not packets_in_flight_[seqno].acked ) {
       assume_departed( packets_in_flight_[seqno], true );
       packets_in_flight_[seqno].assumed_lost = true;
     }
@@ -301,7 +271,8 @@ void NetworkSender::receive_receiver_section( const Packet::ReceiverSection& rec
   stats_.last_good_ack_ts = now;
 }
 
-uint32_t NetworkSender::departure_adjudicated_until_seqno() const
+template<class FrameType>
+uint32_t NetworkSender<FrameType>::departure_adjudicated_until_seqno() const
 {
   uint32_t ret;
   if ( greatest_sack_.has_value() and greatest_sack_.value() > reorder_window ) {
@@ -311,3 +282,5 @@ uint32_t NetworkSender::departure_adjudicated_until_seqno() const
   }
   return ret;
 }
+
+template class NetworkSender<AudioFrame>;

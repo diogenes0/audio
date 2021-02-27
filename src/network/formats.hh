@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 #include "base64.hh"
 #include "crypto.hh"
@@ -9,17 +10,38 @@
 
 struct AudioFrame
 {
-  uint32_t frame_index {}; // units of opus_frame::NUM_SAMPLES, about four months at 2^32 * 120 / 48 kHz
-  opus_frame ch1 {}, ch2 {};
+  uint32_t frame_index {}; // units of opus_frame::NUM_SAMPLES_MINLATENCY, about two months at 2^31 * 120 / 48 kHz
+  bool separate_channels {};
 
-  size_t sample_index() const { return frame_index * opus_frame::NUM_SAMPLES; }
+  opus_frame frame1 {}, frame2 {};
+
+  size_t sample_index() const { return frame_index * opus_frame::NUM_SAMPLES_MINLATENCY; }
 
   uint8_t serialized_length() const;
   void serialize( Serializer& s ) const;
   void parse( Parser& p );
+
+  static constexpr uint8_t frames_per_packet = 8;
 };
 
 static_assert( sizeof( AudioFrame ) == 128 );
+
+struct VideoChunk
+{
+  uint32_t frame_index {}; /* index of this chunk (not video frame) */
+  bool end_of_nal {};
+
+  uint32_t nal_index {};
+
+  using Buffer = StackBuffer<0, uint16_t, 512>;
+  Buffer data {};
+
+  uint16_t serialized_length() const;
+  void serialize( Serializer& s ) const;
+  void parse( Parser& p );
+
+  static constexpr uint8_t frames_per_packet = 2;
+};
 
 template<typename T>
 struct NetInteger
@@ -104,6 +126,7 @@ struct NetArray
 class NetString : public StackBuffer<0, uint8_t, 255>
 {
 public:
+  NetString() {}
   NetString( const std::string_view s )
   {
     resize( s.length() );
@@ -111,18 +134,19 @@ public:
   }
 };
 
+template<class FrameType>
 struct Packet
 {
   struct Record
   {
     uint32_t sequence_number {};
-    NetArray<NetInteger<uint32_t>, 8> frames {};
+    NetArray<NetInteger<uint32_t>, FrameType::frames_per_packet> frames {};
   };
 
   struct SenderSection
   {
     uint32_t sequence_number {};
-    NetArray<AudioFrame, 8> frames {};
+    NetArray<FrameType, FrameType::frames_per_packet> frames {};
 
     Record to_record() const;
   } sender_section {};
@@ -132,6 +156,8 @@ struct Packet
     uint32_t next_frame_needed {};
     NetArray<NetInteger<uint32_t>, 32> packets_received {};
   } receiver_section {};
+
+  NetString unreliable_data_ {};
 
   uint32_t serialized_length() const;
   void serialize( Serializer& s ) const;

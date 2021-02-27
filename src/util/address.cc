@@ -7,6 +7,7 @@
 #include <memory>
 #include <netdb.h>
 #include <stdexcept>
+#include <sys/un.h>
 #include <system_error>
 
 using namespace std;
@@ -35,6 +36,10 @@ Address::Address( const sockaddr* addr, const size_t size )
 
   memcpy( &_address.storage, addr, size );
 }
+
+Address::Address()
+  : _size( 0 )
+{}
 
 //! Error category for getaddrinfo and getnameinfo failures.
 class gai_error_category : public error_category
@@ -151,4 +156,17 @@ bool Address::operator==( const Address& other ) const
   }
 
   return 0 == memcmp( &_address, &other._address, _size );
+}
+
+Address Address::abstract_unix( const string_view name )
+{
+  sockaddr_un address {};
+  address.sun_family = AF_UNIX;
+  if ( name.size() + 1 > sizeof( address.sun_path ) ) {
+    throw runtime_error( "name too long: " + string( name ) );
+  }
+  memset( address.sun_path, 0, sizeof( address.sun_path ) );
+  memcpy( address.sun_path + 1, name.data(), name.size() );
+
+  return { reinterpret_cast<sockaddr*>( &address ), sizeof( address ) };
 }

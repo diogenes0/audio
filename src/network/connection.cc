@@ -2,20 +2,25 @@
 #include <iostream>
 
 #include "connection.hh"
+#include "video_source.hh"
 
 using namespace std;
 
-NetworkConnection::NetworkConnection( const char node_id,
-                                      const char peer_id,
-                                      CryptoSession&& crypto,
-                                      const Address& destination )
+template<class FrameType, class SourceType>
+NetworkConnection<FrameType, SourceType>::NetworkConnection( const char node_id,
+                                                             const char peer_id,
+                                                             CryptoSession&& crypto,
+                                                             const Address& destination )
   : NetworkConnection( node_id, peer_id, move( crypto ) )
 {
   auto_home_ = false;
   destination_.emplace( destination );
 }
 
-NetworkConnection::NetworkConnection( const char node_id, const char peer_id, CryptoSession&& crypto )
+template<class FrameType, class SourceType>
+NetworkConnection<FrameType, SourceType>::NetworkConnection( const char node_id,
+                                                             const char peer_id,
+                                                             CryptoSession&& crypto )
   : node_id_( node_id )
   , peer_id_( peer_id )
   , crypto_( move( crypto ) )
@@ -23,16 +28,23 @@ NetworkConnection::NetworkConnection( const char node_id, const char peer_id, Cr
   , destination_()
 {}
 
-void NetworkConnection::send_packet( UDPSocket& socket )
+template<class FrameType, class SourceType>
+void NetworkConnection<FrameType, SourceType>::send_packet( UDPSocket& socket )
 {
   if ( not has_destination() ) {
     throw runtime_error( "no destination" );
   }
 
   /* make packet to send */
-  Packet pack {};
+  Packet<FrameType> pack {};
   sender_.set_sender_section( pack.sender_section );
   receiver_.set_receiver_section( pack.receiver_section );
+
+  /* do we have room for an unreliable update? */
+  if ( pending_outbound_unreliable_data_.has_value() and ( pack.serialized_length() < 1200 ) ) {
+    pack.unreliable_data_ = pending_outbound_unreliable_data_.value();
+    pending_outbound_unreliable_data_.reset();
+  }
 
   /* serialize */
   Plaintext plaintext;
@@ -47,7 +59,8 @@ void NetworkConnection::send_packet( UDPSocket& socket )
   socket.sendto( destination_.value(), ciphertext );
 }
 
-bool NetworkConnection::receive_packet( const Ciphertext& ciphertext, const Address& source )
+template<class FrameType, class SourceType>
+bool NetworkConnection<FrameType, SourceType>::receive_packet( const Ciphertext& ciphertext, const Address& source )
 {
   if ( not receive_packet( ciphertext ) ) {
     return false;
@@ -67,7 +80,8 @@ bool NetworkConnection::receive_packet( const Ciphertext& ciphertext, const Addr
   return true;
 }
 
-bool NetworkConnection::receive_packet( const Ciphertext& ciphertext )
+template<class FrameType, class SourceType>
+bool NetworkConnection<FrameType, SourceType>::receive_packet( const Ciphertext& ciphertext )
 {
   /* decrypt */
   Plaintext plaintext;
@@ -78,7 +92,7 @@ bool NetworkConnection::receive_packet( const Ciphertext& ciphertext )
 
   /* parse */
   Parser parser { plaintext };
-  const Packet packet { parser };
+  const Packet<FrameType> packet { parser };
   if ( parser.error() ) {
     stats_.invalid++;
     parser.clear_error();
@@ -89,10 +103,15 @@ bool NetworkConnection::receive_packet( const Ciphertext& ciphertext )
   sender_.receive_receiver_section( packet.receiver_section );
   receiver_.receive_sender_section( packet.sender_section );
 
+  if ( packet.unreliable_data_.length() > 0 ) {
+    inbound_unreliable_data_.emplace( packet.unreliable_data_ );
+  }
+
   return true;
 }
 
-void NetworkConnection::summary( ostream& out ) const
+template<class FrameType, class SourceType>
+void NetworkConnection<FrameType, SourceType>::summary( ostream& out ) const
 {
   if ( stats_.decryption_failures ) {
     out << "decryption_failures=" << stats_.decryption_failures << " ";
@@ -105,3 +124,5 @@ void NetworkConnection::summary( ostream& out ) const
   sender_.summary( out );
   receiver_.summary( out );
 }
+
+template class NetworkConnection<AudioFrame, OpusEncoderProcess>;

@@ -46,6 +46,23 @@ public:
       return;
     }
 
+    out = static_cast<T>( 0 );
+    for ( size_t i = 0; i < sizeof( T ); i++ ) {
+      out <<= 8;
+      out += uint8_t( input_.at( i ) );
+    }
+
+    input_.remove_prefix( sizeof( T ) );
+  }
+
+  template<typename T>
+  void floating( T& out )
+  {
+    check_size( sizeof( T ) );
+    if ( error() ) {
+      return;
+    }
+
     memcpy( &out, input_.data(), sizeof( T ) );
     input_.remove_prefix( sizeof( T ) );
   }
@@ -91,6 +108,18 @@ public:
 
   template<typename T>
   void integer( const T& val )
+  {
+    constexpr size_t len = sizeof( T );
+    check_size( len );
+
+    for ( size_t i = 0; i < len; ++i ) {
+      *output_.mutable_data() = ( val >> ( ( len - i - 1 ) * 8 ) ) & 0xff;
+      output_.remove_prefix( 1 );
+    }
+  }
+
+  template<typename T>
+  void floating( const T& val )
   {
     check_size( sizeof( T ) );
     memcpy( output_.mutable_data(), &val, sizeof( T ) );

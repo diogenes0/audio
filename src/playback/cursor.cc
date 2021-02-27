@@ -1,123 +1,214 @@
 #include "cursor.hh"
+#include "ewma.hh"
+
+#include <iostream>
 
 using namespace std;
 
-void Cursor::sample( const PartialFrameStore& frames,
-                     const size_t global_sample_index,
-                     const std::optional<size_t> local_clock_sample_index,
-                     const float jitter_samples,
-                     AudioBuffer& output )
+Cursor::Cursor( const uint32_t target_lag_samples, const uint32_t min_lag_samples, const uint32_t max_lag_samples )
+  : target_lag_samples_( target_lag_samples )
+  , min_lag_samples_( min_lag_samples )
+  , max_lag_samples_( max_lag_samples )
+{}
+
+void Cursor::miss()
+{
+  ewma_update( stats_.quality, 0.0, ALPHA );
+}
+
+void Cursor::hit()
+{
+  ewma_update( stats_.quality, 1.0, ALPHA );
+}
+
+void Cursor::setup( const size_t global_sample_index, const size_t frontier_sample_index )
 {
   /* initialize cursor if necessary */
-  if ( local_clock_sample_index.has_value() ) {
-    if ( ( not cursor_location_.has_value() ) and ( local_clock_sample_index.value() >= target_lag_samples_ ) ) {
-      cursor_location_ = local_clock_sample_index.value() - target_lag_samples_;
-      slew_ = Slew::NO;
-      stats_.resets++;
-    }
-  } else {
-    cursor_location_.reset();
+  if ( not frame_cursor_.has_value() and frontier_sample_index > target_lag_samples_ ) {
+    frame_cursor_ = ( frontier_sample_index - target_lag_samples_ ) / opus_frame::NUM_SAMPLES_MINLATENCY;
+    num_samples_output_ = global_sample_index;
+    rate_ = Rate::Steady;
+    stats_.resets++;
   }
+}
 
-  /* adjust lag if necessary */
-  if ( minimize_lag_ and cursor_location_.has_value() ) {
-    if ( quality_ > 0.9999 and target_lag_samples_ > max( jitter_samples * 5, 240.0f ) ) {
-      target_lag_samples_--;
-    }
+void Cursor::sample( const PartialFrameStore<AudioFrame>& frames,
+                     const size_t frontier_sample_index,
+                     OpusDecoderProcess& decoder,
+                     RubberBand::RubberBandStretcher& stretcher,
+                     AudioSlice& output )
+{
+  bool fade_in_ {};
 
-    if ( target_lag_samples_ < jitter_samples * 2 ) {
-      target_lag_samples_++;
-    }
+  if ( not initialized() ) {
+    throw runtime_error( "Cursor::sample() called on uninitialized Cursor" );
   }
 
   /* adjust cursor if necessary */
-  if ( cursor_location_.has_value() ) {
-    const int64_t cursor_skew = local_clock_sample_index.value() - target_lag_samples_ - cursor_location_.value();
-    if ( cursor_skew > 300 or cursor_skew < -300 ) {
-      /* reset cursor */
-      cursor_location_ = local_clock_sample_index.value() - target_lag_samples_;
-      slew_ = Slew::NO;
-      stats_.resets++;
-    } else if ( cursor_skew > 180 ) {
-      slew_ = Slew::CONSUME_FASTER;
-    } else if ( cursor_skew < -180 ) {
-      slew_ = Slew::CONSUME_SLOWER;
-    } else if ( cursor_skew <= 48 and cursor_skew >= -48 ) {
-      slew_ = Slew::NO;
+  if ( greatest_read_location() >= frontier_sample_index ) {
+    /* underflow, reset */
+    if ( frontier_sample_index < target_lag_samples_ ) {
+      /* not enough audio? */
+      frame_cursor_.reset();
+      num_samples_output_.reset();
+      output.good = false;
+      return;
     }
-    stats_.last_skew = cursor_skew;
+
+    frame_cursor_ = ( frontier_sample_index - target_lag_samples_ ) / opus_frame::NUM_SAMPLES_MINLATENCY;
+    rate_ = Rate::Steady;
+    if ( greatest_read_location() >= frontier_sample_index ) {
+      throw runtime_error( "internal error" );
+    }
+    stats_.resets++;
+    fade_in_ = true;
   }
 
-  /* do we owe any samples to the output? */
-  while ( global_sample_index > num_samples_output_ ) {
-    /* we owe some samples to the output -- how many? */
+  /* sample statistics */
+  const uint64_t frame_cursor = frame_cursor_.value();
 
-    /* do we even know where to get them from? */
-    if ( not cursor_location_.has_value() ) {
-      miss();
-      decoder_.decode_missing( num_samples_output_, output );
-      num_samples_output_ += opus_frame::NUM_SAMPLES;
-      continue;
+  const int64_t margin_to_frontier = frontier_sample_index - greatest_read_location();
+  ewma_update( stats_.mean_margin_to_frontier, margin_to_frontier, ALPHA );
+
+  /* adjust stretching behavior */
+
+  /* 1) should we stop compressing? */
+  if ( rate_ == Rate::Compressing and ( margin_to_frontier <= target_lag_samples_ ) ) {
+    rate_ = Rate::Steady;
+    stretcher.setTimeRatio( 1.00 );
+    stats_.compress_stops++;
+  }
+
+  /* 2) should we stop expanding? */
+  if ( rate_ == Rate::Expanding and ( margin_to_frontier >= target_lag_samples_ ) ) {
+    rate_ = Rate::Steady;
+    stretcher.setTimeRatio( 1.00 );
+    stats_.expand_stops++;
+  }
+
+  /* 3) should we start compressing or expanding? */
+  if ( rate_ == Rate::Steady ) {
+    if ( ( margin_to_frontier > max_lag_samples_ ) and ( stats_.mean_margin_to_frontier > max_lag_samples_ ) ) {
+      rate_ = Rate::Compressing;
+      stretcher.setTimeRatio( 0.95 );
+      stats_.compress_starts++;
+    } else if ( ( margin_to_frontier < min_lag_samples_ )
+                and ( stats_.mean_margin_to_frontier < min_lag_samples_ ) ) {
+      rate_ = Rate::Expanding;
+      stretcher.setTimeRatio( 1.05 );
+      stats_.expand_starts++;
     }
+  }
 
-    uint8_t samples_to_output = opus_frame::NUM_SAMPLES;
-    switch ( slew_ ) {
-      case Slew::NO:
-        break;
-      case Slew::CONSUME_FASTER:
-        samples_to_output--;
-        stats_.samples_skipped++;
-        break;
-      case Slew::CONSUME_SLOWER:
-        samples_to_output++;
-        stats_.samples_inserted++;
-        break;
-    }
+  ewma_update( stats_.mean_time_ratio, stretcher.getTimeRatio(), ALPHA );
 
-    /* okay, we know where to get them from. Do we have an Opus frame ready to decode? */
-    const uint32_t frame_no = cursor_location_.value() / opus_frame::NUM_SAMPLES;
-    if ( not frames.has_value( cursor_location_.value() / opus_frame::NUM_SAMPLES ) ) {
-      miss();
-      decoder_.decode_missing( num_samples_output_, output );
-      num_samples_output_ += samples_to_output;
-      cursor_location_.value() += opus_frame::NUM_SAMPLES;
-      continue;
-    }
+  array<float, opus_frame::NUM_SAMPLES_MINLATENCY> ch1_scratch, ch2_scratch;
+  span<float> ch1_decoded { ch1_scratch.data(), opus_frame::NUM_SAMPLES_MINLATENCY };
+  span<float> ch2_decoded { ch2_scratch.data(), opus_frame::NUM_SAMPLES_MINLATENCY };
 
+  /* Do we have an Opus frame ready to decode? */
+  if ( not frames.has_value( frame_cursor ) ) {
+    /* no, so leave it as silence */
+    miss();
+    fill( ch1_decoded.begin(), ch1_decoded.end(), 0 );
+    fill( ch2_decoded.begin(), ch2_decoded.end(), 0 );
+  } else {
     /* decode a frame! */
     hit();
-    decoder_.decode(
-      frames.at( frame_no ).value().ch1, frames.at( frame_no ).value().ch2, num_samples_output_, output );
-    num_samples_output_ += samples_to_output;
-    cursor_location_.value() += opus_frame::NUM_SAMPLES;
+
+    if ( frames.at( frame_cursor ).value().separate_channels ) {
+      decoder.decode( frames.at( frame_cursor ).value().frame1,
+                      frames.at( frame_cursor ).value().frame2,
+                      ch1_decoded,
+                      ch2_decoded );
+    } else {
+      decoder.decode_stereo( frames.at( frame_cursor ).value().frame1, ch1_decoded, ch2_decoded );
+    }
   }
+
+  if ( fade_in_ ) {
+    for ( uint16_t i = 0; i < opus_frame::NUM_SAMPLES_MINLATENCY; i++ ) {
+      ch1_decoded[i] *= double( i ) / double( opus_frame::NUM_SAMPLES_MINLATENCY );
+      ch2_decoded[i] *= double( i ) / double( opus_frame::NUM_SAMPLES_MINLATENCY );
+    }
+    stats_.fades_in++;
+  }
+
+  /* time-stretch */
+  array<float*, 2> decoded_audio_for_stretcher = { ch1_scratch.data(), ch2_scratch.data() };
+  stretcher.process( decoded_audio_for_stretcher.data(), opus_frame::NUM_SAMPLES_MINLATENCY, false );
+
+  const int samples_available = stretcher.available();
+  if ( samples_available < 0 ) {
+    throw runtime_error( "stretcher.available() < 0" );
+  }
+  const size_t samples_out = samples_available;
+
+  if ( samples_out > output.ch1.size() ) {
+    throw runtime_error( "stretcher output exceeds available output size" );
+  }
+
+  array<float*, 2> stretched_audio_from_stretcher = { output.ch1.data(), output.ch2.data() };
+  if ( samples_out != stretcher.retrieve( stretched_audio_from_stretcher.data(), samples_out ) ) {
+    throw runtime_error( "unexpected output from stretcher.retrieve()" );
+  }
+
+  output.sample_index = num_samples_output_.value();
+  output.length = samples_out;
+  output.good = true;
+
+  num_samples_output_.value() += samples_out;
+  ++frame_cursor_.value();
 }
 
 void Cursor::summary( ostream& out ) const
 {
   out << "Cursor: ";
   out << " target lag=" << target_lag_samples_;
-  out << " quality=" << fixed << setprecision( 5 ) << quality_;
-  out << " inserted=" << stats_.samples_inserted;
-  out << " skipped=" << stats_.samples_skipped;
+  out << " actual lag=" << stats_.mean_margin_to_frontier;
+  out << " quality=" << fixed << setprecision( 5 ) << stats_.quality;
+  out << " time ratio=" << fixed << setprecision( 5 ) << stats_.mean_time_ratio;
+  out << " compressions=" << stats_.compress_starts << "+" << stats_.compress_stops;
+  out << " expansions=" << stats_.expand_starts << "+" << stats_.expand_stops;
+  out << " rate=" << int( rate_ );
   out << " resets=" << stats_.resets;
-  out << " slew=" << int( slew_ );
-  out << " last_skew=" << int( stats_.last_skew );
-  out << " ignored/success/missing=" << decoder_.stats().ignored_decodes << "/"
-      << decoder_.stats().successful_decodes << "/" << decoder_.stats().missing_decodes;
+  out << " fades=" << stats_.fades_in;
   out << "\n";
 }
 
-size_t Cursor::ok_to_pop( const PartialFrameStore& frames ) const
+void Cursor::json_summary( Json::Value& root ) const
 {
-  if ( not cursor_location_.has_value() ) {
+  root["target_lag"] = target_lag_samples_;
+  root["actual_lag"] = stats_.mean_margin_to_frontier;
+  root["quality"] = stats_.quality;
+  root["min_lag"] = min_lag_samples_;
+  root["max_lag"] = max_lag_samples_;
+  root["resets"] = stats_.resets;
+  root["compressions"] = stats_.compress_starts;
+  root["expansions"] = stats_.expand_starts;
+}
+
+void Cursor::default_json_summary( Json::Value& root )
+{
+  root["target_lag"] = 0;
+  root["actual_lag"] = 0;
+  root["quality"] = 0;
+  root["min_lag"] = 0;
+  root["max_lag"] = 0;
+  root["resets"] = 0;
+  root["compressions"] = 0;
+  root["expansions"] = 0;
+}
+
+size_t Cursor::ok_to_pop( const PartialFrameStore<AudioFrame>& frames ) const
+{
+  if ( not frame_cursor_.has_value() ) {
     return 0;
   }
 
-  const size_t next_frame_needed = cursor_location_.value() / opus_frame::NUM_SAMPLES;
-  if ( next_frame_needed <= frames.range_begin() ) {
+  if ( frame_cursor_.value() <= frames.range_begin() ) {
     return 0;
   }
 
-  return next_frame_needed - frames.range_begin();
+  return frame_cursor_.value() - frames.range_begin();
 }

@@ -21,7 +21,7 @@ public:
 
   static std::vector<Device> list();
 
-  static std::pair<std::string, std::string> find_device( const std::string_view expected_description );
+  static std::pair<std::string, std::string> find_device( const std::vector<std::string_view> descriptions );
 };
 
 class PCMFD : public FileDescriptor
@@ -120,8 +120,8 @@ public:
   bool update();
 
   void copy_all_available_samples_to( AudioInterface& other,
-                                      AudioBuffer& capture_output,
-                                      const AudioBuffer& playback_input,
+                                      ChannelPair& capture_output,
+                                      const ChannelPair& playback_input,
                                       AudioStatistics::SampleStats& stats );
 
   const Configuration& config() const { return config_; }
@@ -169,7 +169,7 @@ public:
 
   void start() { microphone_.start(); }
   void recover();
-  void loopback( AudioBuffer& capture_output, const AudioBuffer& playback_input );
+  void loopback( ChannelPair& capture_output, const ChannelPair& playback_input );
 
   bool mic_has_samples();
   unsigned int mic_avail() { return microphone_.avail(); }
@@ -190,5 +190,18 @@ public:
 
 inline float float_to_dbfs( const float sample_f )
 {
+  if ( sample_f <= 0.00001 ) {
+    return -100;
+  }
+
   return 20 * log10( sample_f );
+}
+
+inline float dbfs_to_float( const float dbfs )
+{
+  if ( dbfs <= -99 ) {
+    return 0.0;
+  }
+
+  return exp10( dbfs / 20 );
 }

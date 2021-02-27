@@ -1,7 +1,6 @@
 #pragma once
 
 #include "audio_buffer.hh"
-#include "file_descriptor.hh"
 
 #include <sndfile.hh>
 #include <string>
@@ -13,5 +12,5 @@ class WavWriter
 public:
   WavWriter( const std::string& path, const int sample_rate );
 
-  void write( const AudioBuffer& buffer, const size_t range_end );
+  void write( const ChannelPair& buffer, const size_t range_end );
 };

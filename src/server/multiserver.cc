@@ -27,20 +27,33 @@ void NetworkMultiServer::add_key( const LongLivedKey& key )
   const uint8_t next_id = clients_.size() + 1;
   const uint8_t ch1 = 2 * clients_.size();
   const uint8_t ch2 = ch1 + 1;
-  clients_.emplace_back( next_id, num_clients_ * 2, ch1, ch2, key );
+  clients_.emplace_back( next_id, ch1, ch2, key );
   cerr << "Added key #" << int( next_id ) << " for: " << key.name() << " on channels " << int( ch1 ) << ":"
        << int( ch2 ) << "\n";
 
-  board_.set_name( ch1, string( key.name() ) + "-CH1" );
-  board_.set_name( ch2, string( key.name() ) + "-CH2" );
+  internal_board_.set_channel_name( ch1, string( key.name() ) );
+  internal_board_.set_channel_name( ch2, string( key.name() ) + "-CH2" );
+
+  preview_board_.set_channel_name( ch1, string( key.name() ) );
+  preview_board_.set_channel_name( ch2, string( key.name() ) + "-CH2" );
+
+  program_board_.set_channel_name( ch1, string( key.name() ) );
+  program_board_.set_channel_name( ch2, string( key.name() ) + "-CH2" );
+}
+
+void NetworkMultiServer::initialize_clock()
+{
+  next_cursor_sample_ = server_clock() + opus_frame::NUM_SAMPLES_MINLATENCY;
 }
 
 NetworkMultiServer::NetworkMultiServer( const uint8_t num_clients, EventLoop& loop )
   : socket_()
   , global_ns_timestamp_at_creation_( Timer::timestamp_ns() )
-  , next_cursor_sample_( server_clock() + opus_frame::NUM_SAMPLES )
+  , next_cursor_sample_( server_clock() + opus_frame::NUM_SAMPLES_MINLATENCY )
   , num_clients_( num_clients )
-  , board_( 2 * num_clients )
+  , internal_board_( "internal", 2 * num_clients )
+  , preview_board_( "preview", 2 * num_clients )
+  , program_board_( "program", 2 * num_clients )
 {
   socket_.set_blocking( false );
   socket_.bind( { "0", 9101 } );
@@ -67,12 +80,11 @@ NetworkMultiServer::NetworkMultiServer( const uint8_t num_clients, EventLoop& lo
     "mix+encode+send",
     [&] {
       const uint64_t ts_now = Timer::timestamp_ns();
-      const auto clock_sample = server_clock();
 
       /* decode all audio */
       for ( auto& client : clients_ ) {
         if ( client ) {
-          client.client().decode_audio( clock_sample, next_cursor_sample_, board_ );
+          client.client().decode_audio( next_cursor_sample_, internal_board_, preview_board_, program_board_ );
           if ( client.client().connection().sender_stats().last_good_ack_ts + CLIENT_TIMEOUT_NS < ts_now ) {
             client.clear_current_session();
           }
@@ -82,9 +94,13 @@ NetworkMultiServer::NetworkMultiServer( const uint8_t num_clients, EventLoop& lo
       /* mix all audio */
       for ( auto& client : clients_ ) {
         if ( client ) {
-          client.client().mix_and_encode( client.gains(), board_, next_cursor_sample_ );
+          client.client().mix_and_encode( internal_board_, next_cursor_sample_ );
         }
       }
+
+      internal_audio_.mix_and_write( internal_board_, next_cursor_sample_ );
+      preview_audio_.mix_and_write( preview_board_, next_cursor_sample_ );
+      program_audio_.mix_and_write( program_board_, next_cursor_sample_ );
 
       /* send audio to clients */
       for ( auto& client : clients_ ) {
@@ -94,10 +110,12 @@ NetworkMultiServer::NetworkMultiServer( const uint8_t num_clients, EventLoop& lo
       }
 
       if ( next_cursor_sample_ > 240 ) {
-        board_.pop_samples_until( next_cursor_sample_ - 240 );
+        internal_board_.pop_samples_until( next_cursor_sample_ - 240 );
+        preview_board_.pop_samples_until( next_cursor_sample_ - 240 );
+        program_board_.pop_samples_until( next_cursor_sample_ - 240 );
       }
 
-      next_cursor_sample_ += opus_frame::NUM_SAMPLES;
+      next_cursor_sample_ += opus_frame::NUM_SAMPLES_MINLATENCY;
     },
     [&] { return server_clock() >= next_cursor_sample_; } );
 }
@@ -110,5 +128,52 @@ void NetworkMultiServer::summary( ostream& out ) const
       out << "#" << int( client.client().peer_id() ) << ": ";
       client.summary( out );
     }
+  }
+}
+
+void NetworkMultiServer::json_summary( Json::Value& root, const bool include_second_channels ) const
+{
+  internal_board_.json_summary( root["board"][internal_board_.name()], include_second_channels );
+  preview_board_.json_summary( root["board"][preview_board_.name()], include_second_channels );
+  program_board_.json_summary( root["board"][program_board_.name()], include_second_channels );
+
+  for ( const auto& client : clients_ ) {
+    if ( client ) {
+      client.client().json_summary( root["client"][client.name()] );
+    } else {
+      Client::default_json_summary( root["client"][client.name()] );
+    }
+  }
+}
+
+void NetworkMultiServer::set_cursor_lag( const string_view name,
+                                         const string_view feed,
+                                         const uint16_t target_samples,
+                                         const uint16_t min_samples,
+                                         const uint16_t max_samples )
+{
+  for ( auto& client : clients_ ) {
+    if ( client and client.name() == name ) {
+      client.client().set_cursor_lag( feed, target_samples, min_samples, max_samples );
+    }
+  }
+}
+
+void NetworkMultiServer::set_gain( const string_view board_name,
+                                   const string_view channel_name,
+                                   const float gain1,
+                                   const float gain2 )
+{
+  AudioBoard* target = nullptr;
+  if ( internal_board_.name() == board_name ) {
+    target = &internal_board_;
+  } else if ( program_board_.name() == board_name ) {
+    target = &program_board_;
+  } else if ( preview_board_.name() == board_name ) {
+    target = &preview_board_;
+  }
+
+  if ( target ) {
+    target->set_gain( channel_name, gain1, gain2 );
   }
 }

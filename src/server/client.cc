@@ -3,6 +3,8 @@
 using namespace std;
 using namespace chrono;
 
+using Option = RubberBand::RubberBandStretcher::Option;
+
 uint64_t Client::client_mix_cursor() const
 {
   return mix_cursor_;
@@ -10,13 +12,29 @@ uint64_t Client::client_mix_cursor() const
 
 uint64_t Client::server_mix_cursor() const
 {
-  return mix_cursor_ + outbound_frame_offset_.value() * opus_frame::NUM_SAMPLES;
+  return mix_cursor_ + outbound_frame_offset_.value() * opus_frame::NUM_SAMPLES_MINLATENCY;
+}
+
+AudioFeed::AudioFeed( const string_view name,
+                      const uint32_t target_lag_samples,
+                      const uint32_t min_lag_samples,
+                      const uint32_t max_lag_samples,
+                      const bool short_window )
+  : name_( name )
+  , cursor_( target_lag_samples, min_lag_samples, max_lag_samples )
+  , stretcher_( 48000,
+                2,
+                Option::OptionProcessRealTime | Option::OptionThreadingNever | Option::OptionPitchHighConsistency
+                  | ( short_window ? Option::OptionWindowShort : 0 ) )
+{
+  stretcher_.setMaxProcessSize( opus_frame::NUM_SAMPLES_MINLATENCY );
+  stretcher_.calculateStretch();
 }
 
 Client::Client( const uint8_t node_id, const uint8_t ch1_num, const uint8_t ch2_num, CryptoSession&& crypto )
   : connection_( 0, node_id, move( crypto ) )
-  , clock_( 0 )
-  , cursor_( 960, false )
+  , internal_feed_( "internal", 960, 120, 1920, true )
+  , quality_feed_( "quality", 4800, 4800 - 240, 4800 + 240, false )
   , ch1_num_( ch1_num )
   , ch2_num_( ch2_num )
 {}
@@ -24,36 +42,81 @@ Client::Client( const uint8_t node_id, const uint8_t ch1_num, const uint8_t ch2_
 bool Client::receive_packet( const Address& source, const Ciphertext& ciphertext, const uint64_t clock_sample )
 {
   if ( connection_.receive_packet( ciphertext, source ) ) {
-    clock_.new_sample( clock_sample, connection_.unreceived_beyond_this_frame_index() * opus_frame::NUM_SAMPLES );
     if ( ( not outbound_frame_offset_.has_value() ) and connection_.has_destination() ) {
-      outbound_frame_offset_ = clock_sample / opus_frame::NUM_SAMPLES;
+      outbound_frame_offset_ = clock_sample / opus_frame::NUM_SAMPLES_MINLATENCY;
     }
+
+    if ( connection_.has_inbound_unreliable_data() ) {
+      Parser p { connection_.inbound_unreliable_data() };
+      p.object( last_client_report_ );
+      if ( p.error() ) {
+        p.clear_error();
+      }
+      connection_.pop_inbound_unreliable_data();
+    }
+
     return true;
   }
   return false;
 }
 
-void Client::decode_audio( const uint64_t clock_sample, const uint64_t cursor_sample, AudioBoard& board )
+void AudioFeed::decode_into( const PartialFrameStore<AudioFrame>& frames,
+                             const uint64_t cursor_sample,
+                             const uint64_t frontier_sample_index,
+                             AudioChannel& ch1,
+                             AudioChannel& ch2 )
 {
-  clock_.time_passes( clock_sample );
+  cursor_.setup( cursor_sample, frontier_sample_index );
 
-  AudioBuffer& output = board.buffer( ch1_num_, ch2_num_ );
+  Cursor::AudioSlice audio;
 
-  cursor_.sample( connection_.frames(), cursor_sample, clock_.value(), clock_.jitter(), output );
+  while ( cursor_.initialized() and cursor_sample > cursor_.num_samples_output() ) {
+    cursor_.sample( frames, frontier_sample_index, decoder_, stretcher_, audio );
 
-  connection_.pop_frames( min( cursor_.ok_to_pop( connection_.frames() ),
-                               connection_.next_frame_needed() - connection_.frames().range_begin() ) );
+    if ( audio.good ) {
+      ch1.region( audio.sample_index, audio.length ).copy( audio.ch1_span() );
+      ch2.region( audio.sample_index, audio.length ).copy( audio.ch2_span() );
+    }
+  }
 }
 
-void Client::mix_and_encode( const vector<mix_gain>& gains, const AudioBoard& board, const uint64_t cursor_sample )
+void Client::decode_audio( const uint64_t cursor_sample,
+                           AudioBoard& internal_board,
+                           AudioBoard& quality_board,
+                           AudioBoard& quality_board2 )
+{
+  internal_feed_.decode_into( connection_.frames(),
+                              cursor_sample,
+                              connection_.unreceived_beyond_this_frame_index() * opus_frame::NUM_SAMPLES_MINLATENCY,
+                              internal_board.channel( ch1_num_ ),
+                              internal_board.channel( ch2_num_ ) );
+
+  quality_feed_.decode_into( connection_.frames(),
+                             cursor_sample,
+                             connection_.unreceived_beyond_this_frame_index() * opus_frame::NUM_SAMPLES_MINLATENCY,
+                             quality_board.channel( ch1_num_ ),
+                             quality_board.channel( ch2_num_ ) );
+
+  quality_feed_.decode_into( connection_.frames(),
+                             cursor_sample,
+                             connection_.unreceived_beyond_this_frame_index() * opus_frame::NUM_SAMPLES_MINLATENCY,
+                             quality_board2.channel( ch1_num_ ),
+                             quality_board2.channel( ch2_num_ ) );
+
+  connection_.pop_frames(
+    min( min( internal_feed_.ok_to_pop( connection_.frames() ), quality_feed_.ok_to_pop( connection_.frames() ) ),
+         connection_.next_frame_needed() - connection_.frames().range_begin() ) );
+}
+
+void Client::mix_and_encode( const AudioBoard& board, const uint64_t cursor_sample )
 {
   if ( not outbound_frame_offset_.has_value() ) {
     return;
   }
 
-  while ( server_mix_cursor() + opus_frame::NUM_SAMPLES <= cursor_sample ) {
-    span<float> ch1_target = mixed_audio_.ch1().region( client_mix_cursor(), opus_frame::NUM_SAMPLES );
-    span<float> ch2_target = mixed_audio_.ch2().region( client_mix_cursor(), opus_frame::NUM_SAMPLES );
+  while ( server_mix_cursor() + opus_frame::NUM_SAMPLES_MINLATENCY <= cursor_sample ) {
+    span<float> ch1_target = mixed_audio_.ch1().region( client_mix_cursor(), opus_frame::NUM_SAMPLES_MINLATENCY );
+    span<float> ch2_target = mixed_audio_.ch2().region( client_mix_cursor(), opus_frame::NUM_SAMPLES_MINLATENCY );
 
     for ( uint8_t channel_i = 0; channel_i < board.num_channels(); channel_i++ ) {
       if ( channel_i == ch1_num_ or channel_i == ch2_num_ ) {
@@ -61,11 +124,10 @@ void Client::mix_and_encode( const vector<mix_gain>& gains, const AudioBoard& bo
       }
 
       const span_view<float> other_channel
-        = board.channel( channel_i ).region( server_mix_cursor(), opus_frame::NUM_SAMPLES );
+        = board.channel( channel_i ).region( server_mix_cursor(), opus_frame::NUM_SAMPLES_MINLATENCY );
 
-      const float gain_into_1 = gains.at( channel_i ).first;
-      const float gain_into_2 = gains.at( channel_i ).second;
-      for ( uint8_t sample_i = 0; sample_i < opus_frame::NUM_SAMPLES; sample_i++ ) {
+      const auto [gain_into_1, gain_into_2] = board.gain( channel_i );
+      for ( uint8_t sample_i = 0; sample_i < opus_frame::NUM_SAMPLES_MINLATENCY; sample_i++ ) {
         const float value = other_channel[sample_i];
         const float orig_1 = ch1_target[sample_i];
         const float orig_2 = ch2_target[sample_i];
@@ -75,11 +137,11 @@ void Client::mix_and_encode( const vector<mix_gain>& gains, const AudioBoard& bo
       }
     }
 
-    mix_cursor_ += opus_frame::NUM_SAMPLES;
+    mix_cursor_ += opus_frame::NUM_SAMPLES_MINLATENCY;
   }
 
   /* encode audio */
-  while ( encoder_.min_encode_cursor() + opus_frame::NUM_SAMPLES <= client_mix_cursor() ) {
+  while ( encoder_.min_encode_cursor() + opus_frame::NUM_SAMPLES_MINLATENCY <= client_mix_cursor() ) {
     encoder_.encode_one_frame( mixed_audio_.ch1(), mixed_audio_.ch2() );
     connection_.push_frame( encoder_ );
   }
@@ -100,9 +162,37 @@ void Client::summary( ostream& out ) const
   if ( connection_.has_destination() ) {
     out << " (" << connection_.destination().to_string() << ") ";
   }
-  clock_.summary( out );
-  cursor_.summary( out );
-  connection_.summary( out );
+  internal_feed_.summary( out );
+  quality_feed_.summary( out );
+  //  connection_.summary( out );
+}
+
+void Client::json_summary( Json::Value& root ) const
+{
+  internal_feed_.cursor().json_summary( root["feed"][internal_feed_.name()] );
+  quality_feed_.cursor().json_summary( root["feed"][quality_feed_.name()] );
+
+  root["client"]["resets"] = last_client_report_.resets;
+  root["client"]["target_lag"] = last_client_report_.target_lag;
+  root["client"]["min_lag"] = last_client_report_.min_lag;
+  root["client"]["max_lag"] = last_client_report_.max_lag;
+  root["client"]["actual_lag"] = last_client_report_.actual_lag;
+  root["client"]["quality"] = last_client_report_.quality;
+  root["client"]["self_gain"] = last_client_report_.self_gain;
+}
+
+void Client::default_json_summary( Json::Value& root )
+{
+  Cursor::default_json_summary( root["feed"]["internal"] );
+  Cursor::default_json_summary( root["feed"]["quality"] );
+
+  root["client"]["resets"] = 0;
+  root["client"]["target_lag"] = 0;
+  root["client"]["min_lag"] = 0;
+  root["client"]["max_lag"] = 0;
+  root["client"]["actual_lag"] = 0;
+  root["client"]["quality"] = 0;
+  root["client"]["self_gain"] = 0;
 }
 
 void KnownClient::summary( ostream& out ) const
@@ -145,7 +235,6 @@ bool KnownClient::try_keyrequest( const Address& src, const Ciphertext& cipherte
 }
 
 KnownClient::KnownClient( const uint8_t node_id,
-                          const uint8_t num_channels,
                           const uint8_t ch1_num,
                           const uint8_t ch2_num,
                           const LongLivedKey& key )
@@ -156,12 +245,7 @@ KnownClient::KnownClient( const uint8_t node_id,
   , next_session_( CryptoSession { next_keys_.downlink, next_keys_.uplink } )
   , ch1_num_( ch1_num )
   , ch2_num_( ch2_num )
-{
-  /* set default gains */
-  for ( uint8_t channel_i = 0; channel_i < num_channels; channel_i++ ) {
-    gains_.push_back( { 2.0, 2.0 } );
-  }
-}
+{}
 
 void KnownClient::receive_packet( const Address& src, const Ciphertext& ciphertext, const uint64_t clock_sample )
 {
@@ -183,42 +267,19 @@ void KnownClient::receive_packet( const Address& src, const Ciphertext& cipherte
   }
 }
 
-AudioBoard::AudioBoard( const uint8_t num_channels )
-  : channel_names_()
-  , decoded_audio_()
+void Client::set_cursor_lag( const string_view feed,
+                             const uint16_t target_samples,
+                             const uint16_t min_samples,
+                             const uint16_t max_samples )
 {
-  if ( num_channels % 2 ) {
-    throw runtime_error( "odd number of channels" );
+  AudioFeed* target = nullptr;
+  if ( internal_feed_.name() == feed ) {
+    target = &internal_feed_;
+  } else if ( quality_feed_.name() == feed ) {
+    target = &quality_feed_;
   }
 
-  for ( uint8_t i = 0; i < num_channels; i++ ) {
-    channel_names_.push_back( "Unknown " + to_string( i ) );
-    decoded_audio_.emplace_back( 8192 );
-  }
-}
-
-const AudioChannel& AudioBoard::channel( const uint8_t ch_num ) const
-{
-  const uint8_t buf_num = ch_num / 2;
-  const bool is_ch2 = ch_num % 2;
-  const auto& buf = decoded_audio_.at( buf_num );
-  return is_ch2 ? buf.ch2() : buf.ch1();
-}
-
-AudioBuffer& AudioBoard::buffer( const uint8_t ch1_num, const uint8_t ch2_num )
-{
-  const uint8_t buf_num = ch1_num / 2;
-  if ( ch1_num == buf_num * 2 and ch2_num == ch1_num + 1 ) {
-    return decoded_audio_.at( buf_num );
-  } else {
-    throw runtime_error( "invalid combination of channel numbers: " + to_string( ch1_num ) + ":"
-                         + to_string( ch2_num ) );
-  }
-}
-
-void AudioBoard::pop_samples_until( const uint64_t sample )
-{
-  for ( auto& buf : decoded_audio_ ) {
-    buf.pop_before( sample );
+  if ( target ) {
+    target->cursor().set_target_lag( target_samples, min_samples, max_samples );
   }
 }

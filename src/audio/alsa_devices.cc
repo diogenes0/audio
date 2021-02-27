@@ -98,32 +98,22 @@ vector<ALSADevices::Device> ALSADevices::list()
   return ret;
 }
 
-pair<string, string> ALSADevices::find_device( const string_view expected_description )
+pair<string, string> ALSADevices::find_device( const vector<string_view> descriptions )
 {
   ALSADevices devices;
-  bool found = false;
-
-  string name, interface_name;
 
   for ( const auto& dev : devices.list() ) {
     for ( const auto& interface : dev.interfaces ) {
-      if ( interface.second == expected_description ) {
-        if ( found ) {
-          throw runtime_error( "Multiple devices matching description" );
-        } else {
-          found = true;
-          name = dev.name;
-          interface_name = interface.first;
+      for ( const auto& description : descriptions ) {
+        if ( interface.second.substr( 0, description.length() ) == description ) {
+          cerr << "Found audio device: " << description << ": " << dev.name << "/" << interface.first << endl;
+          return { dev.name, interface.first };
         }
       }
     }
   }
 
-  if ( not found ) {
-    throw runtime_error( "Device \"" + string( expected_description ) + "\" not found" );
-  }
-
-  return { name, interface_name };
+  throw runtime_error( "Audio device not found" );
 }
 
 AudioPair::AudioPair( const string_view interface_name )
@@ -324,7 +314,7 @@ bool AudioPair::mic_has_samples()
   return microphone_.avail();
 }
 
-void AudioPair::loopback( AudioBuffer& capture_output, const AudioBuffer& playback_input )
+void AudioPair::loopback( ChannelPair& capture_output, const ChannelPair& playback_input )
 {
   statistics_.total_wakeups++;
   fd_.register_read();
@@ -353,6 +343,13 @@ void AudioPair::loopback( AudioBuffer& capture_output, const AudioBuffer& playba
   const unsigned int combined = microphone_.avail() + headphone_.delay();
   statistics_.max_combined_samples = max( statistics_.max_combined_samples, combined );
 
+  /*
+  if ( combined > 128 ) {
+    recover();
+    return;
+  }
+  */
+
   microphone_.copy_all_available_samples_to( headphone_, capture_output, playback_input, statistics_.sample_stats );
 }
 
@@ -376,8 +373,8 @@ inline int32_t float_to_sample( const float sample_f )
 }
 
 void AudioInterface::copy_all_available_samples_to( AudioInterface& other,
-                                                    AudioBuffer& capture_output,
-                                                    const AudioBuffer& playback_input,
+                                                    ChannelPair& capture_output,
+                                                    const ChannelPair& playback_input,
                                                     AudioStatistics::SampleStats& stats )
 {
   unsigned int avail_remaining = avail();
@@ -411,7 +408,7 @@ void AudioInterface::copy_all_available_samples_to( AudioInterface& other,
 
       write_buf.sample( true, i )
         = float_to_sample( ch1_sample * config_.ch1_loopback_gain[1] + ch2_sample * config_.ch2_loopback_gain[1]
-                           + playback_sample.first ); /* XXX */
+                           + playback_sample.second );
 
       cursor_++;
     }
